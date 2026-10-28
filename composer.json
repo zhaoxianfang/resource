@@ -1,0 +1,14 @@
+{
+  "name": "zxf/res",
+  "description": "共享静态资源（字体、css、js、图片）包",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "zxf\\res\\": "src/"
+    }
+  }
+}
