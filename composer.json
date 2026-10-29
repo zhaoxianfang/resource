@@ -1,6 +1,6 @@
 {
   "name": "zxf/res",
-  "description": "共享静态资源（字体、css、js、图片）包",
+  "description": "共享静态资源（字体、css、js、图片）包，支持绝对路径、相对路径、浏览器URL以及在Laravel 11+、ThinkPHP 8+和原生PHP 8.2+中的外部资源注册。",
   "type": "library",
   "license": "MIT",
   "require": {
@@ -9,6 +9,16 @@
   "autoload": {
     "psr-4": {
       "zxf\\res\\": "src/"
+    },
+    "files": [
+      "src/helpers.php"
+    ]
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "zxf\\res\\LaravelServiceProvider"
+      ]
     }
   }
 }

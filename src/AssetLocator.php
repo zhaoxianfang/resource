@@ -4,20 +4,22 @@
  * 静态资源定位器。
  *
  * 职责：
- *  - 在本包 assets/ 目录内，为其他 Composer 包提供资源的"路径解析、内容读取、句柄打开、遍历"能力；
- *  - 保证所有访问都经过安全校验，杜绝路径逃逸（../）和符号链接越界；
- *  - 保证跨平台一致性（Windows / Linux / macOS）。
+ *  - 安全解析资源绝对路径（realpath + 前缀校验）；
+ *  - 返回资源相对于分组目录的规范化路径；
+ *  - 判断存在性、读取内容、打开句柄；
+ *  - 流式遍历资源，避免大目录占用内存；
+ *  - 支持注册外部资源目录，扩展可用资源范围。
  *
- * 目录约定：
- *  - assets/ 下的一级子目录名即"分组名"（如 fonts / css / js / images）；
- *  - 分组内支持任意深度的子目录，例如 js/lib/lodash.min.js；
- *  - 文件类型由扩展名识别，集中定义在 AssetType 中。
+ * 约定：
+ *  - 本包 assets/ 下一级子目录名即内置分组名；
+ *  - 开发者可注册外部目录为「虚拟分组」，访问方式与内置分组完全一致；
+ *  - 分组内支持任意深度子目录，如 css/demo/test/base.css；
+ *  - 全程只读，不复制、不发布、不创建符号链接。
  *
- * 设计原则：
- *  - 只读：不复制、不发布、不创建符号链接、不在 vendor/ 内写任何文件；
- *  - 缓存：路径解析结果在进程内缓存，重复访问不重复走磁盘；
- *  - 流式：批量遍历使用 Generator，避免把上千文件一次性装入数组；
- *  - 快速失败：一切异常都显式抛出，不存在静默失败。
+ * 性能设计：
+ *  - 绝对路径、分组目录、分组列表、规范化前缀均进程内缓存；
+ *  - 前缀校验使用 str_starts_with（原生 C 实现）；
+ *  - 遍历使用 Generator，内存占用与文件数无关。
  */
 
 declare(strict_types=1);
@@ -26,42 +28,30 @@ namespace zxf\res;
 
 final class AssetLocator
 {
-    /**
-     * 资源绝对路径缓存。
-     * key 形如 "group\0relative"，使用 \0 作为分隔符，避免 group 和 relative 内容互相污染。
-     *
-     * @var array<string, string>
-     */
+    /** @var array<string, array<string, string>> [分组][相对路径] = 绝对路径 */
     private static array $files = [];
 
-    /**
-     * 分组目录绝对路径缓存。
-     * key 为分组名，value 为该分组经 realpath 规范化后的绝对路径。
-     *
-     * @var array<string, string>
-     */
+    /** @var array<string, string> [分组] = 分组目录规范化绝对路径 */
     private static array $dirs = [];
 
-    /**
-     * 分组名列表缓存。
-     * 首次调用 groups() 时扫描 assets/ 目录得到，之后进程内复用，避免每次请求都扫盘。
-     *
-     * @var list<string>|null
-     */
+    /** @var array<string, string> [分组] = 分组目录规范化前缀（以 / 结尾） */
+    private static array $prefixes = [];
+
+    /** @var array<string, string> [分组] = 外部注册的分组目录绝对路径 */
+    private static array $external = [];
+
+    /** @var list<string>|null 内置 + 外部分组名合并列表 */
     private static ?array $groups = null;
 
-    /**
-     * assets/ 根目录经 realpath 规范化后的绝对路径缓存。
-     *
-     * @var string|null
-     */
+    /** @var string|null assets/ 根目录规范化绝对路径 */
     private static ?string $root = null;
 
+    /** @var string|null assets/ 根目录规范化前缀（以 / 结尾） */
+    private static ?string $rootPrefix = null;
+
     /**
-     * 返回 assets/ 目录的"逻辑路径"（由 __DIR__ 推导，未做 realpath）。
-     *
-     * 说明：使用 __DIR__ 推导，天然适配任意 vendor-dir 配置、任意安装位置，
-     * 且不受调用方 chdir() 影响。
+     * assets/ 目录的逻辑路径。
+     * 由 __DIR__ 推导，不受 chdir、vendor-dir 配置、安装位置影响。
      */
     public static function root(): string
     {
@@ -69,105 +59,126 @@ final class AssetLocator
     }
 
     /**
-     * 返回所有分组名（已排序）。
-     *
-     * 规则：assets/ 下的每个一级子目录即为一个分组；非目录项（散落文件）会被忽略。
+     * 返回全部分组名（已排序），包含内置分组与外部注册的分组。
      *
      * @return list<string>
-     * @throws \RuntimeException 当 assets/ 不存在或不可扫描时抛出。
      */
     public static function groups(): array
     {
-        // 进程内缓存：一次请求只扫描一次目录
         if (self::$groups !== null) {
             return self::$groups;
         }
 
-        $root    = self::realRoot();
-        $entries = \scandir($root);
-        if ($entries === false) {
-            throw new \RuntimeException("无法扫描资源根目录：{$root}");
-        }
-
         $groups = [];
-        foreach ($entries as $entry) {
-            // 跳过特殊目录项
-            if ($entry === '.' || $entry === '..') {
-                continue;
-            }
-            // 只把目录当作分组；散落文件不视为分组
-            if (\is_dir($root . '/' . $entry)) {
-                $groups[] = $entry;
+
+        // 内置分组：扫描本包 assets/
+        $root = \realpath(self::root());
+        if ($root !== false && ($entries = \scandir($root)) !== false) {
+            foreach ($entries as $entry) {
+                if ($entry !== '.' && $entry !== '..' && \is_dir($root . '/' . $entry)) {
+                    $groups[] = $entry;
+                }
             }
         }
 
-        // 排序保证遍历顺序稳定，便于测试和复现
+        // 外部分组：追加注册的目录
+        foreach (\array_keys(self::$external) as $group) {
+            if (!\in_array($group, $groups, true)) {
+                $groups[] = $group;
+            }
+        }
+
         \sort($groups);
         return self::$groups = $groups;
     }
 
     /**
-     * 解析某个分组下某个资源的绝对路径。
-     *
-     * 安全校验流程：
-     *  1. 通过 groupDir() 确认分组合法且落在 assets/ 内；
-     *  2. 用 realpath() 解析相对路径，得到规范化绝对路径；
-     *  3. 用 within() 做规范化前缀校验，拒绝逃逸出分组目录的路径；
-     *  4. 用 is_file() + is_readable() 确认是可读的普通文件。
-     *
-     * @param string $group    分组名（assets/ 下的一级目录名）。
-     * @param string $relative 分组内的相对路径，使用正斜杠分隔，支持子目录。
-     * @return string          资源文件的绝对路径。
-     * @throws \InvalidArgumentException 分组不存在时抛出。
-     * @throws \RuntimeException         资源不存在、逃逸、不可读时抛出。
+     * 判断分组是否存在（内置或外部注册）。
      */
-    public static function resolve(string $group, string $relative): string
+    public static function hasGroup(string $group): bool
     {
-        // 命中缓存直接返回，避免重复走 realpath 等系统调用
-        $key = $group . "\0" . $relative;
-        if (isset(self::$files[$key])) {
-            return self::$files[$key];
+        return \in_array($group, self::groups(), true);
+    }
+
+    /**
+     * 解析资源绝对路径。
+     *
+     * 校验流程：
+     *  1. groupDir() 确认分组存在且合法；
+     *  2. realpath() 解析相对路径（自动处理 //、./、../）；
+     *  3. 规范化前缀校验，拒绝 ../ 与符号链接逃逸；
+     *  4. is_file() + is_readable() 确认为可读普通文件。
+     *
+     * @param string $group    分组名。
+     * @param string $relative 分组内相对路径，正斜杠分隔，支持任意深度子目录。
+     * @return string          资源绝对路径。
+     * @throws \InvalidArgumentException 分组非法时。
+     * @throws \RuntimeException         资源不存在、越界或不可读时。
+     */
+    public static function path(string $group, string $relative): string
+    {
+        if (isset(self::$files[$group][$relative])) {
+            return self::$files[$group][$relative];
         }
 
         $base = self::groupDir($group);
+        $real = \realpath($base . '/' . \ltrim(\str_replace('\\', '/', $relative), '/'));
 
-        // 将相对路径中的反斜杠统一为正斜杠，ltrim 去掉可能的前导斜杠
-        // 说明：realpath 在 Windows 上会自动把 / 转成 \，所以统一用 / 构造是安全的
-        $candidate = $base . '/' . \ltrim(\str_replace('\\', '/', $relative), '/');
-
-        $real = \realpath($candidate);
         if ($real === false) {
-            // realpath 返回 false 表示路径不存在（文件缺失、路径含非法字符等）
             throw new \RuntimeException("资源不存在：{$group}/{$relative}");
         }
-
-        // 前缀校验：防止 "../" 或符号链接把访问带出分组目录
-        if (!self::within($real, $base)) {
+        if (!\str_starts_with(\str_replace('\\', '/', $real), self::$prefixes[$group])) {
             throw new \RuntimeException("资源路径越界：{$group}/{$relative}");
         }
-
-        // 必须是可读的普通文件：排除目录、设备文件、不可读文件
         if (!\is_file($real) || !\is_readable($real)) {
             throw new \RuntimeException("资源不可读：{$group}/{$relative}");
         }
 
-        return self::$files[$key] = $real;
+        return self::$files[$group][$relative] = $real;
     }
 
     /**
-     * 读取资源文件的全部内容。
+     * 返回资源相对于分组目录的规范化路径（含分组名）。
      *
-     * 适用场景：css、js、svg 等小文件。
-     * 对于大字体、大图片，请使用 stream() 以避免一次性占用大量内存。
+     * 内置分组与外部注册分组规则一致：
+     *  - relative('fonts',    'regular.woff2') => "fonts/regular.woff2"
+     *  - relative('myicons',  'star.svg')      => "myicons/star.svg"
      *
-     * @param string $group    分组名。
-     * @param string $relative 分组内相对路径。
-     * @return string          文件内容。
-     * @throws \RuntimeException 读取失败时抛出。
+     * 结果基于 realpath 反推，自动归一化 //、./、../。
+     *
+     * @throws \InvalidArgumentException|\RuntimeException
+     */
+    public static function relative(string $group, string $relative): string
+    {
+        $absolute = self::path($group, $relative);
+        $base     = \rtrim(\str_replace('\\', '/', self::groupDir($group)), '/') . '/';
+        $rel      = \substr(\str_replace('\\', '/', $absolute), \strlen($base));
+
+        return $group . '/' . $rel;
+    }
+
+    /**
+     * 判断资源是否存在且可读。不抛异常，便于可选加载。
+     */
+    public static function exists(string $group, string $relative): bool
+    {
+        try {
+            self::path($group, $relative);
+            return true;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * 读取资源全部内容。适合 css / js / svg 等小文件；
+     * 大字体、大图片请使用 stream()。
+     *
+     * @throws \RuntimeException 读取失败时。
      */
     public static function read(string $group, string $relative): string
     {
-        $content = \file_get_contents(self::resolve($group, $relative));
+        $content = \file_get_contents(self::path($group, $relative));
         if ($content === false) {
             throw new \RuntimeException("读取资源失败：{$group}/{$relative}");
         }
@@ -175,20 +186,14 @@ final class AssetLocator
     }
 
     /**
-     * 打开资源文件的只读句柄。
+     * 以只读二进制句柄打开资源。调用方必须自行 fclose。
      *
-     * 适用场景：大字体、大图片、需要流式复制或分段处理的文件。
-     * 调用方必须自行 fclose() 关闭句柄，避免句柄泄漏。
-     *
-     * @param string $group    分组名。
-     * @param string $relative 分组内相对路径。
-     * @return resource        以 "rb" 模式打开的只读句柄。
-     * @throws \RuntimeException 打开失败时抛出。
+     * @return resource
+     * @throws \RuntimeException 打开失败时。
      */
     public static function stream(string $group, string $relative)
     {
-        // 使用 "rb" 二进制模式，避免 Windows 文本模式把 \r\n 或 \x1A 当作特殊字符处理
-        $handle = \fopen(self::resolve($group, $relative), 'rb');
+        $handle = \fopen(self::path($group, $relative), 'rb');
         if ($handle === false) {
             throw new \RuntimeException("打开资源失败：{$group}/{$relative}");
         }
@@ -198,74 +203,181 @@ final class AssetLocator
     /**
      * 遍历某个分组内的资源。
      *
-     * 使用 RecursiveIteratorIterator 流式遍历，不会把文件列表一次性读入数组，
-     * 即使分组内有数千个文件，内存占用也保持恒定。
+     * 若某个符号链接指向分组外部，path() 会拒绝；
+     * 此处通过 try-catch 跳过单个文件，不中断整个遍历。
      *
-     * @param string          $group 分组名。
-     * @param AssetType|null  $type  类型过滤；为 null 时不按类型过滤。
-     * @return \Generator<string, string> 相对路径 => 绝对路径。
-     * @throws \InvalidArgumentException 分组不存在时抛出。
+     * @param string         $group 分组名（内置或外部注册）。
+     * @param AssetType|null $type  类型过滤；null 表示不过滤。
+     * @return \Generator<string, string> 相对路径 => 绝对路径
+     * @throws \InvalidArgumentException 分组不存在时。
      */
     public static function iterate(string $group, ?AssetType $type = null): \Generator
     {
-        $base = self::groupDir($group);
-
-        // SKIP_DOTS 会跳过 "." 和 ".."，避免把它们当作文件处理
-        $iterator = new \RecursiveIteratorIterator(
+        $base      = self::groupDir($group);
+        $iterator  = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($base, \FilesystemIterator::SKIP_DOTS)
         );
-
-        // 计算子串起点：base 长度 + 1（去掉分隔符）
         $prefixLen = \strlen($base) + 1;
 
         foreach ($iterator as $file) {
             /** @var \SplFileInfo $file */
-
-            // 只处理普通文件；目录项由 RecursiveIteratorIterator 自身处理
             if (!$file->isFile()) {
                 continue;
             }
 
-            // 从完整路径裁出相对于分组目录的部分，并统一为正斜杠
-            // 注意：Windows 下 getPathname() 返回的反斜杠需要归一化，否则 key 不一致
             $relative = \str_replace('\\', '/', \substr($file->getPathname(), $prefixLen));
-
-            // 按扩展名识别类型；未识别扩展名跳过
             $fileType = AssetType::fromPath($relative);
-            if ($fileType === null) {
+
+            if ($fileType === null || ($type !== null && $fileType !== $type)) {
                 continue;
             }
 
-            // 类型过滤
-            if ($type !== null && $fileType !== $type) {
+            try {
+                $absolute = self::path($group, $relative);
+            } catch (\RuntimeException) {
                 continue;
             }
 
-            // 交给 resolve() 做安全校验并返回绝对路径（首次访问会走磁盘，之后走缓存）
-            yield $relative => self::resolve($group, $relative);
+            yield (string) $relative => $absolute;
         }
     }
 
     /**
-     * 跨全部分组遍历资源。
+     * 跨全部分组遍历资源（含外部注册）。
      *
-     * @param AssetType|null $type 类型过滤；为 null 时不过滤。
-     * @return \Generator<string, string> "组/相对路径" => 绝对路径。
+     * @param AssetType|null $type 类型过滤；null 表示不过滤。
+     * @return \Generator<string, string> "组/相对路径" => 绝对路径
      */
     public static function iterateAll(?AssetType $type = null): \Generator
     {
         foreach (self::groups() as $group) {
             foreach (self::iterate($group, $type) as $relative => $absolute) {
-                // 以 "组/相对路径" 作为 key，避免不同分组的同名文件冲突
-                yield "{$group}/{$relative}" => $absolute;
+                yield (string) "{$group}/{$relative}" => $absolute;
             }
         }
     }
 
     /**
-     * 返回 assets/ 根目录的规范化绝对路径。
+     * 注册一个外部资源目录为虚拟分组。
      *
-     * @throws \RuntimeException assets/ 目录不存在时抛出。
+     * 分组名与内置分组冲突时抛异常；重复注册同一分组会覆盖旧路径。
+     * 注册后可通过 path() / relative() / iterate() / xf_res_url() 等
+     * 与内置分组完全相同的方式访问。
+     *
+     * @param string $group 分组名，只允许字母、数字、下划线、连字符，且以字母或下划线开头。
+     * @param string $path  外部资源目录绝对路径或相对当前工作目录的路径。
+     * @throws \InvalidArgumentException 分组名非法、路径非法、与内置分组冲突时。
+     */
+    public static function registerGroup(string $group, string $path): void
+    {
+        if (!\preg_match('/^[A-Za-z_][A-Za-z0-9_-]*$/', $group)) {
+            throw new \InvalidArgumentException(
+                "非法分组名：{$group}（只允许字母、数字、下划线、连字符，且以字母或下划线开头）"
+            );
+        }
+
+        $real = \realpath($path);
+        if ($real === false || !\is_dir($real)) {
+            throw new \InvalidArgumentException("外部资源路径不存在或不是目录：{$path}");
+        }
+        if (!\is_readable($real)) {
+            throw new \InvalidArgumentException("外部资源路径不可读：{$path}");
+        }
+
+        // 内置分组冲突检测
+        $root = \realpath(self::root());
+        if ($root !== false && \is_dir($root . '/' . $group)) {
+            throw new \InvalidArgumentException("分组名与内置资源冲突：{$group}");
+        }
+
+        self::$external[$group] = $real;
+
+        // 失效该分组的缓存与汇总缓存
+        self::$groups = null;
+        unset(self::$dirs[$group], self::$prefixes[$group], self::$files[$group]);
+    }
+
+    /**
+     * 批量注册外部资源目录为虚拟分组。
+     *
+     * @param array<string, string> $groups [分组名 => 目录路径]
+     * @throws \InvalidArgumentException 任一分组或路径非法时。
+     */
+    public static function registerGroups(array $groups): void
+    {
+        foreach ($groups as $group => $path) {
+            self::registerGroup((string) $group, (string) $path);
+        }
+    }
+
+    /**
+     * 注册一个外部 assets 根目录，自动把其中的一级子目录注册为分组。
+     *
+     * @param string $assetsPath 外部 assets 根目录。
+     * @param string $prefix     可选，给所有自动识别的分组名加前缀，避免与内置分组冲突。
+     *                           例如 prefix='ext' 时，子目录 icons 会注册为 'ext_icons'。
+     * @throws \InvalidArgumentException 根目录非法时。
+     * @throws \RuntimeException         无法扫描根目录时。
+     */
+    public static function registerRoot(string $assetsPath, string $prefix = ''): void
+    {
+        $real = \realpath($assetsPath);
+        if ($real === false || !\is_dir($real)) {
+            throw new \InvalidArgumentException("外部资源根目录不存在或不是目录：{$assetsPath}");
+        }
+
+        $entries = \scandir($real);
+        if ($entries === false) {
+            throw new \RuntimeException("无法扫描外部资源根目录：{$assetsPath}");
+        }
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $sub = $real . '/' . $entry;
+            if (!\is_dir($sub)) {
+                continue;
+            }
+            $groupName = $prefix === '' ? $entry : $prefix . '_' . $entry;
+            self::registerGroup($groupName, $sub);
+        }
+    }
+
+    /**
+     * 注销一个外部注册的分组。
+     * 若该分组是内置分组则不做任何处理。
+     */
+    public static function unregisterGroup(string $group): void
+    {
+        if (!isset(self::$external[$group])) {
+            return;
+        }
+        unset(
+            self::$external[$group],
+            self::$dirs[$group],
+            self::$prefixes[$group],
+            self::$files[$group]
+        );
+        self::$groups = null;
+    }
+
+    /**
+     * 清空全部外部注册的分组。
+     */
+    public static function clearRegisteredGroups(): void
+    {
+        foreach (\array_keys(self::$external) as $group) {
+            unset(self::$dirs[$group], self::$prefixes[$group], self::$files[$group]);
+        }
+        self::$external = [];
+        self::$groups   = null;
+    }
+
+    /**
+     * 返回 assets/ 根目录规范化绝对路径。
+     *
+     * @throws \RuntimeException assets/ 不存在时。
      */
     private static function realRoot(): string
     {
@@ -276,14 +388,20 @@ final class AssetLocator
     }
 
     /**
-     * 返回某个分组目录的规范化绝对路径，同时完成合法性校验。
+     * 返回 assets/ 根目录规范化前缀（以 / 结尾）。
+     */
+    private static function rootPrefix(): string
+    {
+        return self::$rootPrefix ??= \rtrim(\str_replace('\\', '/', self::realRoot()), '/') . '/';
+    }
+
+    /**
+     * 返回分组目录规范化绝对路径，并缓存其规范化前缀。
      *
-     * 校验点：
-     *  - realpath 必须成功（目录存在）；
-     *  - 必须是目录；
-     *  - 必须在 assets/ 根目录之内（防止 group 参数本身就是 "../xxx"）。
+     * 优先级：外部注册 > 内置。注册时已拒绝与内置冲突，
+     * 因此正常情况下两者不会重叠；此处外部优先仅为防御性编码。
      *
-     * @throws \InvalidArgumentException 分组非法时抛出。
+     * @throws \InvalidArgumentException 分组非法时。
      */
     private static function groupDir(string $group): string
     {
@@ -291,33 +409,26 @@ final class AssetLocator
             return self::$dirs[$group];
         }
 
+        // 1) 外部注册分组
+        if (isset(self::$external[$group])) {
+            $dir = self::$external[$group];
+            self::$prefixes[$group] = \rtrim(\str_replace('\\', '/', $dir), '/') . '/';
+            return self::$dirs[$group] = $dir;
+        }
+
+        // 2) 内置分组
         $root = self::realRoot();
         $dir  = \realpath($root . '/' . $group);
-
-        // 三重校验：存在 + 是目录 + 在根目录内
-        if ($dir === false || !\is_dir($dir) || !self::within($dir, $root)) {
+        if ($dir === false || !\is_dir($dir)) {
             throw new \InvalidArgumentException("未知资源分组：{$group}");
         }
 
-        return self::$dirs[$group] = $dir;
-    }
+        $dirPrefix = \rtrim(\str_replace('\\', '/', $dir), '/') . '/';
+        if (!\str_starts_with($dirPrefix, self::rootPrefix())) {
+            throw new \InvalidArgumentException("未知资源分组：{$group}");
+        }
 
-    /**
-     * 判断 $path 是否落在 $base 目录之内（含子目录）。
-     *
-     * 实现要点：
-     *  - 先把两边的反斜杠统一为正斜杠，保证 Windows / Linux / macOS 比较一致；
-     *  - 对 $base 去掉尾部斜杠后再补一个 "/"，防止 "/base-evil" 被误判为 "/base" 内；
-     *  - 使用 str_starts_with 做前缀比较（PHP 8 原生，性能优于 strncmp）。
-     *
-     * 注意：调用本方法前，$path 和 $base 必须已经是 realpath 规范化后的绝对路径，
-     * 否则 ".." 和符号链接未被解析，前缀比较结果不可靠。
-     */
-    private static function within(string $path, string $base): bool
-    {
-        return \str_starts_with(
-            \str_replace('\\', '/', $path),
-            \rtrim(\str_replace('\\', '/', $base), '/') . '/'
-        );
+        self::$prefixes[$group] = $dirPrefix;
+        return self::$dirs[$group] = $dir;
     }
 }

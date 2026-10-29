@@ -1,24 +1,20 @@
 # zxf/res
 
-一个随 Composer 包分发的静态资源库，用于在多个 Composer 包之间共享**字体、CSS、JS、图片**文件。
+随 Composer 包分发的静态资源库，支持在**绝对路径**、**相对路径**、**浏览器 URL** 三种维度下加载字体、CSS、JS、图片，并支持注册外部资源包目录。
 
-**核心特性：**
-
-- 资源随包安装到 `vendor/zxf/res/assets/`，**不发布、不复制到 vendor 之外、不创建符号链接**；
-- 全程**只读**，兼容 `--no-dev`、只读挂载、Windows 无管理员权限等场景；
-- **跨平台**：Windows / Linux / macOS 行为一致，无路径分隔符和权限差异；
-- **安全**：`realpath` + 规范化前缀校验，杜绝 `../` 与符号链接逃逸；
-- **高性能**：所有路径解析结果进程内缓存，批量遍历用 `Generator`，不构建中间数组；
-- **极简**：仅 2 个源文件，无清单、无构建脚本、无 Composer 插件依赖。
+- 资源始终位于 `vendor/zxf/res/assets/`，**不发布、不复制、不软链**；
+- 全程只读，兼容 `--no-dev`、只读挂载、Windows 无管理员权限；
+- 支持分组内任意深度子目录：`xf_res_url('css', 'demo/test/base.css')`；
+- 支持开发者注册外部资源目录为虚拟分组；
+- 兼容 Laravel 11+ / ThinkPHP 8+ / 原生 PHP 8.2+；
+- 路由前缀统一为 `/zxf/res`；助手函数统一使用 `xf_res_` 前缀。
 
 ---
 
 ## 环境要求
 
 - PHP >= 8.2
-- Composer 2
-
----
+- Laravel >= 11 或 ThinkPHP >= 8 或原生 PHP 8.2+
 
 ## 安装
 
@@ -26,267 +22,297 @@
 composer require zxf/res
 ```
 
-安装后，资源位于：
-
-```text
-vendor/zxf/res/assets/
-```
-
-无需执行任何发布、复制或软链命令。
-
----
+安装后资源位于 `vendor/zxf/res/assets/`，无需任何发布或复制命令。
 
 ## 目录约定
 
 ```text
-vendor/zxf/res/
-├── assets/
-│   ├── fonts/              ← 分组：fonts
-│   │   ├── regular.woff2
-│   │   └── bold.woff2
-│   ├── css/                ← 分组：css
-│   │   └── base.css
-│   ├── js/                 ← 分组：js
-│   │   ├── core.js
-│   │   └── lib/
-│   │       └── lodash.min.js
-│   └── images/             ← 分组：images
-│       └── logo.png
-└── src/
-    ├── AssetType.php
-    └── AssetLocator.php
+vendor/zxf/res/assets/
+├── fonts/regular.woff2
+├── css/
+│   ├── base.css
+│   └── demo/test/base.css
+├── js/
+│   ├── core.js
+│   └── lib/lodash.min.js
+└── images/logo.png
 ```
 
-**约定规则：**
-
-1. `assets/` 下**一级子目录名**即“分组名”（`fonts`、`css`、`js`、`images` 或你自定义的任意名字）；
-2. 分组内**支持任意深度的子目录**，例如 `js/lib/lodash.min.js`；
-3. 分组名和相对路径中的所有分隔符统一使用正斜杠 `/`；
-4. 文件类型由**扩展名**自动识别，未识别的扩展名在遍历时会被自动跳过。
+- `assets/` 下**一级子目录名即分组名**；
+- 分组内**支持任意深度子目录**；
+- 扩展名决定类型：`woff/woff2/ttf/otf/eot/sfnt`（字体）、`css`、`js/mjs/cjs`、`png/jpg/jpeg/gif/webp/avif/svg/ico/bmp/tif/tiff`（图片）。
 
 ---
 
-## 支持的资源类型
+## 三种加载方式
 
-由 `zxf\res\AssetType` 枚举集中管理：
+| 方式 | 助手函数 | 返回值示例 | 适用场景 |
+|---|---|---|---|
+| 绝对路径 | `xf_res_path('fonts', 'regular.woff2')` | `/path/to/vendor/zxf/res/assets/fonts/regular.woff2` | PDF 引擎、图片处理 |
+| 相对路径 | `xf_res_relative('css', 'demo/test/base.css')` | `css/demo/test/base.css` | 日志、调试 |
+| 浏览器 URL | `xf_res_url('css', 'demo/test/base.css')` | `https://host/zxf/res/css/demo/test/base.css` | `<link>`、`<script>`、`<img>` |
 
-| 类型 | `AssetType` 值               | 支持的扩展名                                                          |
-|------|------------------------------|-----------------------------------------------------------------------|
-| 字体 | `AssetType::Font`  → `font`  | `woff` `woff2` `ttf` `otf` `eot` `sfnt`                               |
-| 样式 | `AssetType::Css`   → `css`   | `css`                                                                 |
-| 脚本 | `AssetType::Js`    → `js`    | `js` `mjs` `cjs`                                                      |
-| 图片 | `AssetType::Image` → `image` | `png` `jpg` `jpeg` `gif` `webp` `avif` `svg` `ico` `bmp` `tif` `tiff` |
+---
 
-扩展新格式只需修改 `src/AssetType.php` 中的 `match` 分支。
+## 外部资源注册
+
+支持把**其他 Composer 包**或**任意目录**中的资源注册为本包的虚拟分组，
+之后可像访问内置资源一样访问它们（路径、URL、HTTP 代理完全一致）。
+
+### 注册单个外部分组
+
+```php
+xf_res_register_group('myicons', '/path/to/another/package/assets/icons');
+
+// 之后即可：
+xf_res_path('myicons', 'star.svg');        // 绝对路径
+xf_res_relative('myicons', 'star.svg');    // "myicons/star.svg"
+xf_res_url('myicons', 'star.svg');         // https://host/zxf/res/myicons/star.svg
+```
+
+### 批量注册
+
+```php
+xf_res_register_groups([
+    'myicons' => '/path/to/icons',
+    'myfonts' => '/path/to/fonts',
+]);
+```
+
+### 注册整个外部 assets 根目录
+
+自动把一级子目录注册为分组：
+
+```php
+xf_res_register_root('/path/to/another/package/assets');
+// 该目录下的 icons、fonts、js 等一级目录会自动注册为分组
+```
+
+若担心与内置分组冲突，可加前缀：
+
+```php
+xf_res_register_root('/path/to/another/package/assets', 'ext');
+// 自动注册为 ext_icons、ext_fonts、ext_js ...
+```
+
+### 注销与清空
+
+```php
+xf_res_unregister_group('myicons');   // 注销单个
+xf_res_clear_groups();                // 清空全部外部注册（内置不受影响）
+xf_res_has_group('myicons');          // 判断分组是否存在
+xf_res_groups();                      // 获取全部分组名（含外部）
+```
+
+### 注册约束
+
+- 分组名只允许字母、数字、下划线、连字符，且以字母或下划线开头；
+- 外部目录必须是真实存在的可读目录；
+- **不允许覆盖内置分组**（`fonts`、`css`、`js`、`images` 等），冲突时抛 `InvalidArgumentException`；
+- 外部资源同样经过 `realpath` + 前缀校验，无路径逃逸风险。
+
+---
+
+## Laravel 11+ 接入
+
+### 1. 自动注册路由
+
+`composer.json` 已声明 `extra.laravel.providers`，**安装即生效**，无需手动注册服务提供者。
+
+使用 `route:cache` 时执行一次：
+
+```bash
+php artisan route:cache
+```
+
+### 2. Blade 中使用
+
+```blade
+{{-- 内置资源 --}}
+<link rel="stylesheet" href="{{ xf_res_url('css', 'base.css') }}">
+<script src="{{ xf_res_url('js', 'lib/lodash.min.js') }}"></script>
+<img src="{{ xf_res_url('images', 'logo.png') }}" alt="logo">
+
+{{-- 外部注册资源 --}}
+<link rel="stylesheet" href="{{ xf_res_url('myicons', 'icon.css') }}">
+
+<style>
+@font-face {
+    font-family: 'Regular';
+    src: url('{{ xf_res_url('fonts', 'regular.woff2') }}') format('woff2');
+}
+</style>
+```
+
+### 3. 在 Laravel 中注册外部资源
+
+在 `app/Providers/AppServiceProvider.php` 的 `boot()` 中注册一次：
+
+```php
+use zxf\res\AssetLocator;
+
+public function boot(): void
+{
+    // 方式一：注册单个外部目录
+    AssetLocator::registerGroup('myicons', base_path('node_modules/my-icons/dist'));
+
+    // 方式二：批量
+    AssetLocator::registerGroups([
+        'mycss' => '/path/to/another/package/assets/css',
+        'myjs'  => '/path/to/another/package/assets/js',
+    ]);
+
+    // 方式三：注册整个外部 assets 根目录（自动识别一级子目录）
+    AssetLocator::registerRoot('/path/to/another/package/assets');
+}
+```
+
+### 4. 在 Laravel 中使用绝对路径
+
+```php
+$fontPath = xf_res_path('fonts', 'regular.woff2');
+
+// 交给 PDF 引擎（Dompdf、TCPDF 等）
+$pdf->registerFont($fontPath);
+```
+
+---
+
+## ThinkPHP 8+ 接入
+
+### 1. 注册路由
+
+在 `route/app.php` 中注册：
+
+```php
+use think\facade\Route;
+
+Route::get('zxf/res/<group>/<path>', function (string $group, string $path) {
+    xf_res_serve($group, $path);
+    exit; // 阻止 TP8 继续输出
+})->pattern(['path' => '.+'])->name('zxf-res.asset');
+```
+
+### 2. 注册外部资源
+
+在 `app/event.php` 的 `AppInit` 事件监听中，或 `app/common.php` 中：
+
+```php
+use zxf\res\AssetLocator;
+
+AssetLocator::registerGroup('myicons', root_path('node_modules/my-icons/dist'));
+```
+
+### 3. 模板中使用
+
+```php
+<link rel="stylesheet" href="{:xf_res_url('css', 'demo/test/base.css')}">
+<script src="{:xf_res_url('js', 'lib/lodash.min.js')}"></script>
+<img src="{:xf_res_url('images', 'logo.png')}">
+```
+
+---
+
+## 原生 PHP 8.2+ 接入
+
+### 1. 入口文件
+
+```php
+<?php
+require __DIR__ . '/vendor/autoload.php';
+
+// 可选：注册外部资源
+xf_res_register_group('myicons', __DIR__ . '/node_modules/my-icons/dist');
+
+// 拦截资源请求
+$prefix = xf_res_route_prefix(); // "/zxf/res"
+$uri    = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+
+if (str_starts_with($uri, $prefix . '/')) {
+    $rest = rawurldecode(substr($uri, strlen($prefix) + 1));
+    [$group, $path] = array_pad(explode('/', $rest, 2), 2, '');
+
+    xf_res_serve($group, $path);
+    exit;
+}
+
+// 其他路由
+echo 'Hello';
+```
+
+### 2. HTML 中使用
+
+```html
+<link rel="stylesheet" href="<?= xf_res_url('css', 'demo/test/base.css') ?>">
+<script src="<?= xf_res_url('js', 'lib/lodash.min.js') ?>"></script>
+<img src="<?= xf_res_url('images', 'logo.png') ?>">
+```
+
+### 3. Nginx 可选优化（跳过 PHP）
+
+```nginx
+location ^~ /zxf/res/ {
+    rewrite ^/zxf/res/(.*)$ /$1 break;
+    alias /path/to/project/vendor/zxf/res/assets/;
+}
+```
+
+> 此配置让 Web 服务器直接响应，性能最优；但注意**外部注册的分组不在此规则内**（它们在别的目录下），仍走 PHP 代理。
 
 ---
 
 ## API 一览
 
-命名空间全小写：`zxf\res`。
+### 助手函数（无命名空间，`xf_res_` 前缀）
 
-### `AssetLocator`
+| 函数 | 返回值 | 说明 |
+|---|---|---|
+| `xf_res_path($g, $r)` | string | 绝对路径 |
+| `xf_res_relative($g, $r)` | string | 相对分组目录的规范化路径 |
+| `xf_res_exists($g, $r)` | bool | 存在性判断，不抛异常 |
+| `xf_res_read($g, $r)` | string | 读取全文（小文件） |
+| `xf_res_route_prefix()` | string | 固定返回 `/zxf/res` |
+| `xf_res_browser_path($g, $r)` | string | 浏览器路径（无域名） |
+| `xf_res_url($g, $r, $base)` | string | 浏览器完整 URL |
+| `xf_res_prepare($g, $r)` | array | 资源元数据 |
+| `xf_res_etag_matches($h, $etag)` | bool | ETag 匹配判断 |
+| `xf_res_serve($g, $r)` | void | 直接发送 HTTP 响应 |
+| `xf_res_register_group($g, $p)` | void | 注册单个外部组 |
+| `xf_res_register_groups($map)` | void | 批量注册外部组 |
+| `xf_res_register_root($p, $prefix)` | void | 注册外部 assets 根目录 |
+| `xf_res_unregister_group($g)` | void | 注销外部组 |
+| `xf_res_clear_groups()` | void | 清空外部注册 |
+| `xf_res_has_group($g)` | bool | 分组是否存在 |
+| `xf_res_groups()` | array | 全部分组名 |
+| `xf_res_all($type)` | array | 按类型收集资源 |
+| `xf_res_fonts()` / `xf_res_css()` / `xf_res_js()` / `xf_res_images()` | array | 分类收集 |
 
-| 方法                                                          | 返回值                      | 用途                              |
-|---------------------------------------------------------------|-----------------------------|-----------------------------------|
-| `root(): string`                                              | `assets/` 逻辑路径          | 获取资源根目录                    |
-| `groups(): array`                                             | `list<string>`              | 获取所有分组名（已排序）          |
-| `resolve(string $group, string $relative): string`            | 绝对路径                    | 解析单个资源，结果缓存            |
-| `read(string $group, string $relative): string`               | 文件内容                    | 读取小文件（css / js / svg）      |
-| `stream(string $group, string $relative)`                     | `resource`                  | 打开大文件句柄，由调用方 `fclose` |
-| `iterate(string $group, ?AssetType $type = null): \Generator` | `相对路径 => 绝对路径`      | 遍历单个分组，可按类型过滤        |
-| `iterateAll(?AssetType $type = null): \Generator`             | `"组/相对路径" => 绝对路径` | 跨组遍历                          |
+### 类 API（命名空间 `zxf\res`）
 
-### `AssetType`
-
-| 方法 / 成员                                    | 说明                                  |
-|------------------------------------------------|---------------------------------------|
-| `AssetType::Font` / `Css` / `Js` / `Image`     | 四种类型枚举                          |
-| `AssetType::fromExtension(string $ext): ?self` | 按扩展名识别类型，未识别返回 `null`   |
-| `AssetType::fromPath(string $path): ?self`     | 按文件路径识别类型，未识别返回 `null` |
-
-**异常约定：**
-
-- 分组或资源不存在、路径逃逸 → `InvalidArgumentException` / `RuntimeException`；
-- 文件不可读、读取失败 → `RuntimeException`；
-- **不存在静默失败**，调用方可以放心捕获异常。
-
----
-
-## 使用示例
-
-### 1. 解析单个资源路径
-
-```php
-use zxf\res\AssetLocator;
-
-$fontPath = AssetLocator::resolve('fonts', 'lishu.ttf');
-// => /path/to/vendor/zxf/res/assets/fonts/lishu.ttf
-
-// 直接用于需要文件路径的库，例如 Dompdf、TCPDF
-$pdf->setFont($fontPath, 'normal', 12);
-```
-
-### 2. 读取小文件内容
-
-```php
-use zxf\res\AssetLocator;
-
-$css = AssetLocator::read('css', 'base.css');
-$js  = AssetLocator::read('js', 'core.js');
-
-file_put_contents('/tmp/bundle.css', $css . "\n" . $js);
-```
-
-### 3. 处理大字体 / 大图片
-
-```php
-use zxf\res\AssetLocator;
-
-$handle = AssetLocator::stream('fonts', 'lishu.ttf');
-try {
-    // 流式读取，不会把整个字体读入内存
-    while (!feof($handle)) {
-        fwrite($target, fread($handle, 8192));
-    }
-} finally {
-    fclose($handle);
-}
-```
-
-### 4. 遍历某个分组
-
-```php
-use zxf\res\AssetLocator;
-
-foreach (AssetLocator::iterate('js') as $relative => $absolute) {
-    echo "JS: {$relative} => {$absolute}\n";
-}
-// 输出：
-// JS: core.js => /path/to/assets/js/core.js
-// JS: lib/lodash.min.js => /path/to/assets/js/lib/lodash.min.js
-```
-
-### 5. 按类型过滤
-
-```php
-use zxf\res\AssetLocator;
-use zxf\res\AssetType;
-
-// 只遍历 images 分组下的图片
-foreach (AssetLocator::iterate('images', AssetType::Image) as $relative => $absolute) {
-    // ...
-}
-
-// 跨所有分组，只收集字体
-$fonts = [];
-foreach (AssetLocator::iterateAll(AssetType::Font) as $key => $absolute) {
-    $fonts[$key] = $absolute;
-}
-// $fonts = ['fonts/regular.woff2' => '...', 'fonts/bold.woff2' => '...']
-```
-
-### 6. 生成 CSS `@font-face` 片段
-
-```php
-use zxf\res\AssetLocator;
-use zxf\res\AssetType;
-
-$rules = '';
-foreach (AssetLocator::iterateAll(AssetType::Font) as $key => $absolute) {
-    $name = pathinfo($key, PATHINFO_FILENAME);
-    $url  = 'file://' . $absolute;
-    $rules .= "@font-face { font-family: '{$name}'; src: url('{$url}'); }\n";
-}
-```
-
-### 7. 复制到指定目录（调用方自己控制，本包不代劳）
-
-```php
-use zxf\res\AssetLocator;
-
-$dest = __DIR__ . '/public/assets';
-
-foreach (AssetLocator::iterateAll() as $key => $absolute) {
-    $target = $dest . '/' . $key;
-    if (!is_dir(dirname($target))) {
-        mkdir(dirname($target), 0755, true);
-    }
-    copy($absolute, $target);
-}
-```
-
-> 本包只负责**定位与读取**，是否复制、复制到哪里、如何暴露给浏览器，完全由调用方决定。
+- `AssetLocator::path()` / `relative()` / `exists()` / `read()` / `stream()` / `iterate()` / `iterateAll()` / `groups()` / `hasGroup()` / `root()` / `registerGroup()` / `registerGroups()` / `registerRoot()` / `unregisterGroup()` / `clearRegisteredGroups()`
+- `AssetServer::prepare()` / `isNotModified()` / `notModifiedHeaders()` / `send()`
+- `AssetType::fromExtension()` / `fromPath()` / `mimeFor()`
 
 ---
 
-## 不依赖本包 API 的使用方式
+## 安全说明
 
-如果只想拿一两个固定文件、不想引入 `AssetLocator`，可以直接用 Composer 2 内置的 `InstalledVersions`：
+- **路径逃逸**：所有入口经 `realpath` + 规范化前缀校验，`../` 与符号链接逃逸被拒绝；
+- **外部注册冲突**：不允许覆盖内置分组，冲突时抛 `InvalidArgumentException`；
+- **代理滥用**：仅 `AssetType` 声明的扩展名可被代理输出，`.php`、`.env` 等敏感文件无法通过代理读取；
+- **MIME 混淆**：响应带 `X-Content-Type-Options: nosniff`；
+- **大文件 OOM**：所有输出使用 `readfile` 流式；
+- **Host 头**：`xf_res_url()` 使用 `$_SERVER['HTTP_HOST']`，最终由应用层校验 Host。
 
-```php
-use Composer\InstalledVersions;
+## 性能说明
 
-$root = InstalledVersions::getInstallPath('zxf/res');
-$path = $root . '/assets/fonts/regular.woff2';
-```
+- `xf_res_url()` 首次调用一次 `realpath`，之后走进程内缓存，零 IO；
+- `AssetServer::prepare()` 一次 `stat()` 同时拿到 size 与 mtime；
+- ETag 由 `mtime+size` 组成，不读文件内容；
+- 强缓存 `max-age=31536000, immutable` + ETag 协商，浏览器二次访问不达服务器；
+- 大文件流式输出，内存占用 O(1)；
+- 注册外部分组后自动失效相关缓存，不影响已缓存的内置分组。
 
-> **注意**：这种方式**绕过了安全校验**，只能用于**代码中写死的固定路径**，**绝不要**把外部输入拼接进去。
-
----
-
-## 安全性
-
-所有资源访问都经过以下校验：
-
-1. **分组校验**：`group` 参数通过 `realpath` 解析后必须落在 `assets/` 内；
-2. **路径校验**：资源路径通过 `realpath` 解析后必须落在分组目录内；
-3. **前缀校验**：使用规范化后的字符串前缀比较（带 `/` 结尾），防止 `/base-evil` 绕过 `/base`；
-4. **文件校验**：必须是 `is_file()` 且 `is_readable()` 的普通可读文件。
-
-因此以下输入会直接抛异常：
-
-```php
-AssetLocator::resolve('fonts', '../../../etc/passwd');   // 逃逸 → RuntimeException
-AssetLocator::resolve('fonts', '/etc/passwd');           // 绝对路径被 ltrim 后仍逃逸 → RuntimeException
-AssetLocator::resolve('../../etc', 'passwd');            // 分组逃逸 → InvalidArgumentException
-```
-
----
-
-## 跨平台说明
-
-| 风险点                 | 处理方式                                                            |
-|------------------------|---------------------------------------------------------------------|
-| 路径分隔符             | 统一使用正斜杠 `/`；`realpath` 结果为平台原生格式，比较前统一规范化 |
-| Windows 无符号链接权限 | 本包**不使用** `symlink` / `junction` / `copy`，天然无权限问题      |
-| `vendor/` 只读挂载     | 全程只读，无任何写操作                                              |
-| OPcache                | 静态文件、无运行时写缓存，进程内缓存只在单次请求生命周期内存在      |
-| `chdir()` 影响         | 所有路径基于 `__DIR__` 推导，不受当前工作目录影响                   |
-| 自定义 `vendor-dir`    | 包内使用 `__DIR__`，自动适配任意 `vendor-dir` 配置                  |
-
----
-
-## 常见问题
-
-**Q：为什么不把资源发布到 `public/`？**
-
-A：因为发布通常需要 `symlink`（Windows 权限问题）、`copy`（重复存储、更新不同步）或专用插件（额外依赖）。本包的设计目标是**让 PHP 代码在运行时能定位到资源**，至于是否复制到 `public/`、如何让浏览器访问，应由调用方按自己的部署策略决定（见「使用示例 7」）。
-
-**Q：为什么没有 `asset-manifest.json`？**
-
-A：清单的价值在于"白名单"和"构建期报错"。如果你的诉求只是"共享 resources 目录"，`RecursiveDirectoryIterator` 本身就是惰性流式迭代，性能与清单持平，且无需维护同步问题。只有在需要**精确控制哪些文件对外可见**时才值得引入清单。
-
-**Q：可以新增自定义分组吗？**
-
-A：可以。`assets/` 下任意一级子目录都是合法分组，无需注册、无需改代码。例如新增 `assets/pdf/`，直接调用 `AssetLocator::resolve('pdf', 'template.html')` 即可。
-
-**Q：可以新增自定义扩展名吗？**
-
-A：可以。在 `src/AssetType.php` 的 `fromExtension()` 的 `match` 分支中追加扩展名即可。未识别的扩展名在 `iterate()` 中会被跳过，但 `resolve()` / `read()` / `stream()` 仍可直接访问。
-
----
-
-## 许可证
+## License
 
 MIT
